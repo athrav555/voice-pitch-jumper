@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Voice Pitch Jumper</title>
+    <style>
+         :root {
+            --primary: #4F46E5;
+            --bg-color: #111827;
+            --text-color: #F9FAFB;
+        }
+        /* Prevent pull-to-refresh and scrolling on mobile */
+        
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            touch-action: none;
+        }
+        
+        #game-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            /* Auto-adjust on mobile portrait vs landscape */
+            aspect-ratio: 2 / 1;
+            max-height: 100vh;
+            background-color: #1F2937;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.8);
+            overflow: hidden;
+        }
+        /* On very tall, thin screens (portrait), make it wider to fill the screen */
+        
+        @media (max-aspect-ratio: 1/1) {
+            #game-container {
+                aspect-ratio: auto;
+                height: 50vh;
+            }
+        }
+        
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: fill;
+        }
+        
+        .overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(17, 24, 39, 0.9);
+            z-index: 10;
+            text-align: center;
+            padding: 5%;
+            box-sizing: border-box;
+        }
+        
+        h1 {
+            margin-bottom: 10px;
+            font-size: clamp(1.8rem, 5vw, 2.5rem);
+        }
+        
+        p {
+            margin-bottom: 30px;
+            font-size: clamp(1rem, 3vw, 1.2rem);
+            color: #D1D5DB;
+        }
+        /* Larger buttons for mobile touch targets */
+        
+        button {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            font-size: clamp(1.2rem, 4vw, 1.5rem);
+            font-weight: bold;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: transform 0.1s, background-color 0.2s;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            /* Prevent text selection on tap */
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        
+        button:active {
+            transform: scale(0.95);
+            background-color: #4338CA;
+        }
+        
+        #score-display {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            font-size: clamp(1.2rem, 4vw, 1.5rem);
+            font-weight: bold;
+            z-index: 5;
+            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+        }
+        
+        #pitch-display {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            font-size: clamp(0.9rem, 3vw, 1rem);
+            color: #9CA3AF;
+            z-index: 5;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+
+        <div id="score-display">Score: <span id="score">0</span></div>
+        <div id="pitch-display">Hz: <span id="current-pitch">--</span></div>
+
+        <!-- Start Screen -->
+        <div id="start-screen" class="overlay">
+            <h1>Voice Pitch Jumper</h1>
+            <p>Sing or hum to jump! <br><strong>Higher Pitch = Higher Jump.</strong></p>
+            <button id="start-btn">Allow Mic & Play</button>
+        </div>
+
+        <!-- Game Over Screen -->
+        <div id="game-over-screen" class="overlay hidden">
+            <h1>Game Over!</h1>
+            <p>Final Score: <span id="final-score">0</span></p>
+            <button id="restart-btn">Play Again</button>
+        </div>
+    </div>
+
+    <script>
+        // --- Canvas & Mobile Resolution Handling ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d', {
+            alpha: false
+        });
+
+        // We keep a fixed logical size so game physics behave identically on all screen sizes
+        const LOGICAL_WIDTH = 800;
+        const LOGICAL_HEIGHT = 400;
+
+        function resizeCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = LOGICAL_WIDTH * dpr;
+            canvas.height = LOGICAL_HEIGHT * dpr;
+            ctx.scale(dpr, dpr);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- Game Variables ---
+        let gameState = 'START';
+        let score = 0;
+        let frames = 0;
+        let obstacles = [];
+        let gameSpeed = 5;
+        let jumpCooldown = 0;
+        let wakeLock = null;
+
+        // --- Audio API Variables ---
+        let audioContext;
+        let analyser;
+        let microphone;
+        const buflen = 2048;
+        const buf = new Float32Array(buflen);
+        const corrBuffer = new Float32Array(buflen);
+
+        // --- Mobile Screen Wake Lock API ---
+        // Prevents the screen from turning off while playing via voice
+        async function requestWakeLock() {
+            if ('wakeLock' in navigator) {
+                try {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                } catch (err) {
+                    console.log(`Wake Lock error: ${err.name}, ${err.message}`);
+                }
+            }
+        }
+
+        document.addEventListener('visibilitychange', async() => {
+            if (wakeLock !== null && document.visibilityState === 'visible' && gameState === 'PLAYING') {
+                await requestWakeLock();
+            }
+        });
+
+        // --- Stickman Player Class ---
+        class Player {
+            constructor() {
+                this.x = 100;
+                this.groundY = LOGICAL_HEIGHT - 40;
+                this.y = this.groundY;
+                this.vy = 0;
+                this.gravity = 0.6;
+                this.width = 20;
+                this.height = 50;
+                this.isGrounded = true;
+            }
+
+            jump(pitch) {
+                if (this.isGrounded) {
+                    const minPitch = 100,
+                        maxPitch = 600;
+                    const minJumpForce = -10,
+                        maxJumpForce = -20;
+
+                    let clampedPitch = Math.max(minPitch, Math.min(pitch, maxPitch));
+                    let pitchRatio = (clampedPitch - minPitch) / (maxPitch - minPitch);
+
+                    this.vy = minJumpForce + (pitchRatio * (maxJumpForce - minJumpForce));
+                    this.isGrounded = false;
+                }
+            }
+
+            update() {
+                this.y += this.vy;
+                if (!this.isGrounded) {
+                    this.vy += this.gravity;
+                }
+
+                if (this.y >= this.groundY) {
+                    this.y = this.groundY;
+                    this.vy = 0;
+                    this.isGrounded = true;
+                }
+            }
+
+            draw() {
+                ctx.strokeStyle = '#F9FAFB';
+                ctx.lineWidth = 3;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+
+                let headY = this.y - 40;
+
+                // Head
+                ctx.arc(this.x, headY, 10, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Body
+                ctx.beginPath();
+                ctx.moveTo(this.x, headY + 10);
+                ctx.lineTo(this.x, this.y - 15);
+
+                // Arms
+                ctx.moveTo(this.x - 15, headY + 20);
+                ctx.lineTo(this.x + 15, headY + 20);
+
+                // Legs
+                ctx.moveTo(this.x, this.y - 15);
+                ctx.lineTo(this.x - 10, this.y);
+                ctx.moveTo(this.x, this.y - 15);
+                ctx.lineTo(this.x + 10, this.y);
+
+                ctx.stroke();
+            }
+
+            getBounds() {
+                return {
+                    x: this.x - this.width / 2,
+                    y: this.y - this.height,
+                    w: this.width,
+                    h: this.height
+                };
+            }
+        }
+
+        // --- Obstacle Class ---
+        class Obstacle {
+            constructor() {
+                this.w = 30 + Math.random() * 20;
+                this.h = 30 + Math.random() * 40;
+                this.x = LOGICAL_WIDTH;
+                this.y = LOGICAL_HEIGHT - 40 - this.h;
+                this.passed = false;
+            }
+
+            update() {
+                this.x -= gameSpeed;
+            }
+
+            draw() {
+                ctx.fillStyle = '#EF4444';
+                ctx.fillRect(this.x, this.y, this.w, this.h);
+            }
+
+            getBounds() {
+                return {
+                    x: this.x,
+                    y: this.y,
+                    w: this.w,
+                    h: this.h
+                };
+            }
+        }
+
+        const player = new Player();
+
+        // --- Audio Processing (Pitch Detection) ---
+        function autoCorrelate(buffer, sampleRate) {
+            let rms = 0;
+            for (let i = 0; i < buffer.length; i++) {
+                rms += buffer[i] * buffer[i];
+            }
+            rms = Math.sqrt(rms / buffer.length);
+
+            // Volume Threshold - slightly higher for mobile to ignore handling noise
+            if (rms < 0.08) return -1;
+
+            let r1 = 0,
+                r2 = buffer.length - 1,
+                thres = 0.2;
+            for (let i = 0; i < buffer.length / 2; i++)
+                if (Math.abs(buffer[i]) < thres) {
+                    r1 = i;
+                    break;
+                }
+            for (let i = 1; i < buffer.length / 2; i++)
+                if (Math.abs(buffer[buffer.length - i]) < thres) {
+                    r2 = buffer.length - i;
+                    break;
+                }
+
+            let bufSlice = buffer.subarray(r1, r2);
+            let SIZE = bufSlice.length;
+
+            for (let i = 0; i < SIZE; i++) {
+                corrBuffer[i] = 0;
+                for (let j = 0; j < SIZE - i; j++) {
+                    corrBuffer[i] += bufSlice[j] * bufSlice[j + i];
+                }
+            }
+
+            let d = 0;
+            while (corrBuffer[d] > corrBuffer[d + 1]) d++;
+            let maxval = -1,
+                maxpos = -1;
+            for (let i = d; i < SIZE; i++) {
+                if (corrBuffer[i] > maxval) {
+                    maxval = corrBuffer[i];
+                    maxpos = i;
+                }
+            }
+            return sampleRate / maxpos;
+        }
+
+        async function initAudio() {
+            if (!audioContext) {
+                // iOS Safari requires webkitAudioContext
+                audioContext = new(window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = buflen;
+
+                try {
+                    // Mobile devices require explicit user permission
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: false, // Turn off processing to get raw pitch
+                            autoGainControl: false,
+                            noiseSuppression: false
+                        }
+                    });
+                    microphone = audioContext.createMediaStreamSource(stream);
+                    microphone.connect(analyser);
+                } catch (err) {
+                    alert('Microphone access is required to play! Please check your browser permissions.');
+                    return false;
+                }
+            }
+
+            // Crucial for iOS: Resume context strictly within the touch event execution
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            return true;
+        }
+
+        // --- Game Logic ---
+        function checkCollision(rect1, rect2) {
+            return (
+                rect1.x < rect2.x + rect2.w &&
+                rect1.x + rect1.w > rect2.x &&
+                rect1.y < rect2.y + rect2.h &&
+                rect1.y + rect1.h > rect2.y
+            );
+        }
+
+        function resetGame() {
+            player.y = player.groundY;
+            player.vy = 0;
+            obstacles = [];
+            score = 0;
+            frames = 0;
+            gameSpeed = 5;
+            jumpCooldown = 0;
+            gameState = 'PLAYING';
+            document.getElementById('score').innerText = score;
+            document.getElementById('game-over-screen').classList.add('hidden');
+            requestWakeLock();
+        }
+
+        function gameLoop() {
+            if (gameState !== 'PLAYING') {
+                requestAnimationFrame(gameLoop);
+                return;
+            }
+
+            ctx.fillStyle = '#1F2937';
+            ctx.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+
+            ctx.fillStyle = '#374151';
+            ctx.fillRect(0, LOGICAL_HEIGHT - 40, LOGICAL_WIDTH, 40);
+
+            if (jumpCooldown > 0) jumpCooldown--;
+
+            if (analyser) {
+                analyser.getFloatTimeDomainData(buf);
+                let pitch = autoCorrelate(buf, audioContext.sampleRate);
+
+                if (pitch !== -1) {
+                    document.getElementById('current-pitch').innerText = Math.round(pitch);
+                    if (player.isGrounded && jumpCooldown === 0) {
+                        player.jump(pitch);
+                        jumpCooldown = 15;
+                    }
+                } else {
+                    document.getElementById('current-pitch').innerText = '--';
+                }
+            }
+
+            player.update();
+            player.draw();
+
+            if (frames % 90 === 0) {
+                obstacles.push(new Obstacle());
+                gameSpeed += 0.03;
+            }
+
+            for (let i = obstacles.length - 1; i >= 0; i--) {
+                let obs = obstacles[i];
+                obs.update();
+                obs.draw();
+
+                if (checkCollision(player.getBounds(), obs.getBounds())) {
+                    gameState = 'GAMEOVER';
+                    document.getElementById('final-score').innerText = score;
+                    document.getElementById('game-over-screen').classList.remove('hidden');
+
+                    // Release wakelock when game is over
+                    if (wakeLock !== null) {
+                        wakeLock.release().then(() => wakeLock = null);
+                    }
+                }
+
+                if (obs.x + obs.w < player.x && !obs.passed) {
+                    score += 10;
+                    obs.passed = true;
+                    document.getElementById('score').innerText = score;
+                }
+
+                if (obs.x + obs.w < 0) {
+                    obstacles.splice(i, 1);
+                }
+            }
+
+            frames++;
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- Event Handlers (Using standard 'click' which triggers reliably on mobile taps) ---
+        document.getElementById('start-btn').addEventListener('click', async() => {
+            const initialized = await initAudio();
+            if (initialized) {
+                document.getElementById('start-screen').classList.add('hidden');
+                resetGame();
+            }
+        });
+
+        document.getElementById('restart-btn').addEventListener('click', () => {
+            resetGame();
+        });
+
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+
+</html>
